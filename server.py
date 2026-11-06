@@ -403,7 +403,10 @@ def hint_for(module: str, method: str) -> str:
         return (f"{method} is in the catalog but was not seen in this firmware's "
                 f"UI, so it may have been removed or renamed. Try api_search for "
                 f"the replacement, or rebuild the catalog from your firmware.")
-    example = entry.get("in_example")
+    # A doc-comment example came out of this router's own firmware, so it beats
+    # one borrowed from an older published catalog.
+    docs = entry.get("vendor_docs") or {}
+    example = docs.get("in_example") or entry.get("in_example")
     if example:
         return f"catalog example: {example}"
     return how_to_call(module, method, entry)
@@ -574,6 +577,41 @@ def api_modules() -> dict:
     }
 
 
+def param_names(entry: dict) -> tuple[list[str], str]:
+    """
+    Parameter names for a catalog entry, and what they are based on.
+
+    Three sources of different authority, best first:
+      * `params` -- typed parameters from the published catalog. Real types,
+        and the only source that was written down on purpose.
+      * `vendor_docs` -- the doc comments some handlers carry in the firmware,
+        which state intent and come with a literal example payload.
+      * `params_static` -- keys the handler actually reads off its argument,
+        recovered from firmware source or bytecode. Behaviour, not contract:
+        a key can be read and ignored, and a key validated inside a helper this
+        pass does not follow is missing. Good enough to stop guessing, not good
+        enough to trust blind on a write.
+
+    Returning the basis matters more than returning the names. "sensitivity"
+    from a doc comment and "sensitivity" inferred from a GETTABLE are not the
+    same claim, and a caller deciding whether to write to the router should be
+    able to tell them apart.
+    """
+    typed = [p.get("keyName") for p in entry.get("params", []) if p.get("keyName")]
+    if typed:
+        return typed, "vendor catalog"
+    static = entry.get("params_static") or []
+    if static:
+        if entry.get("vendor_docs"):
+            basis = "the handler's own doc comment"
+        elif entry.get("params_origin") == "handler source":
+            basis = "keys read off the argument in the firmware's handler source"
+        else:
+            basis = "keys read off the argument in the firmware's handler bytecode"
+        return list(static), basis
+    return [], ""
+
+
 def how_to_call(module: str, method: str, entry: dict) -> str:
     """
     One line saying what to actually send, derived from how the router's own UI
@@ -594,17 +632,19 @@ def how_to_call(module: str, method: str, entry: dict) -> str:
     if style in ("variable", "expression"):
         api = entry.get("ui_api")
         where = f" in {api}()" if api else " elsewhere in the calling view"
-        keys = [p.get("keyName") for p in entry.get("params", []) if p.get("keyName")]
+        keys, basis = param_names(entry)
         if keys:
-            return ("needs a payload with " + ", ".join(keys)
-                    + f" -- the router's UI builds it{where}")
+            return (f"needs a payload with {', '.join(keys)} -- recovered from "
+                    f"{basis}; the UI builds it{where}")
         return (f"needs a payload the UI builds{where}; the parameter names are "
                 "not documented -- read the UI bundle, or send a minimal object "
                 "and let the router report what is missing")
-    if entry.get("params"):
-        return ("parameters: " + ", ".join(
-            f"{p.get('keyName')}:{p.get('dataType__name') or '?'}"
-            for p in entry["params"]))
+    keys, basis = param_names(entry)
+    if keys:
+        typed = {p.get("keyName"): p.get("dataType__name") or "?"
+                 for p in entry.get("params", [])}
+        shown = ", ".join(f"{k}:{typed.get(k, '?')}" for k in keys)
+        return f"parameters: {shown} (from {basis})"
     return "argument shape unknown -- the UI never calls it, so nothing observed it"
 
 
@@ -659,6 +699,7 @@ def api_search(query: str, limit: int = 15) -> dict:
                 score += 10
             source = entry.get("source", "")
             style = entry.get("arg_style", "")
+            keys, basis = param_names(entry)
             # A method the 4.10.1 UI really calls is known to exist; one left
             # over from the 4.7 snapshot is a guess. Rank guesses below facts and
             # say which is which, so a stale hit cannot read like a live one.
@@ -671,12 +712,29 @@ def api_search(query: str, limit: int = 15) -> dict:
                 "params": [
                     {"name": p.get("keyName"), "type": p.get("dataType__name")}
                     for p in entry.get("params", [])
-                ],
+                ] or [{"name": k, "type": None} for k in keys],
                 "example": entry.get("in_example"),
                 "how_to_call": how_to_call(mod, name, entry),
                 "arg_style": style or "unknown",
                 "source": source or "unknown vintage",
             }
+            if basis:
+                hit["params_basis"] = basis
+            docs = entry.get("vendor_docs")
+            if docs:
+                # The vendor's own words, so they go out ahead of anything this
+                # tool inferred: a description, the documented input fields, and
+                # a literal example payload that can be sent as-is.
+                hit["vendor_description"] = docs.get("desc", "")
+                if docs.get("in"):
+                    hit["documented_inputs"] = [
+                        f"{f['path']} ({f['type']})" for f in docs["in"]]
+                if docs.get("out"):
+                    hit["response_fields"] = [f["path"] for f in docs["out"][:12]]
+                    if len(docs["out"]) > 12:
+                        hit["response_fields_more"] = len(docs["out"]) - 12
+                if docs.get("in_example"):
+                    hit["example"] = docs["in_example"]
             if variants:
                 hit["also_exists_as"] = variants
                 hit["spelling_warning"] = (

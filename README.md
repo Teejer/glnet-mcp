@@ -93,6 +93,62 @@ in this repo is written here; the catalog is a build artifact, like a lockfile.
 
 On a BE9300 running 4.10.1 this produces 347 methods across 51 modules.
 
+## Where parameters come from
+
+The catalog knows which methods exist; parameters are a separate problem, and
+the handlers themselves answer it. They ship in the firmware at
+`usr/lib/oui-httpd/rpc`, one file per module, in three kinds:
+
+| kind | count | what it gives up |
+|---|---|---|
+| plain Lua source | 18 | `params.<key>` reads, readable directly |
+| Lua 5.1 bytecode | 37 | same, via a small disassembler |
+| ELF shared object | 10 | nothing yet — policy tables need disassembly |
+
+```bash
+./extract_handler_docs.py /path/to/extracted-rootfs --apply
+```
+
+`luaread.py` reads the bytecode. It is **not stock Lua 5.1**: a 12-byte header
+with no `LUAC_DATA`/`LUAC_INT` magic (stock `lua5.1` rejects these files as
+"bad header"), field widths declared at bytes 7..10 that differ between builds,
+upvalue records that are name-only, and an extra opcode inserted after
+`GETTABLE` that shifts every opcode above it — so the table-store is 9, not 8.
+Every one of those was settled by parsing a file compiled locally from known
+source, not read out of a specification. 37 of 37 handler files parse to EOF.
+
+A method name pairs with its body because `function M.get_config(params)`
+compiles to a `CLOSURE` plus a store whose key is the string `"get_config"`, and
+the parameters are the keys the body reads off its first argument. The rule is
+deliberately narrow. Promoting upvalue-loaded registers to "the argument" also
+promotes `uci` and `fs`, and turned `kmwan.set_sensitivity`'s single real key
+into five, four of them file and JSON helpers. Requiring a declared parameter is
+what stops `get_config()`, which uses register 0 for a uci cursor, from
+inventing inputs.
+
+Eight handler files also carry the vendor's own doc comments — `@in`/`@out` with
+typed field paths plus a literal `@in-example`/`@out-example`. That is the only
+source here stating intent rather than behaviour, and it wins on ties.
+
+Recovered names are labelled with where they came from, because the two kinds of
+claim are not equivalent:
+
+```
+"how_to_call": "needs a payload with sensitivity -- recovered from keys read
+                off the argument in the firmware's handler bytecode"
+"params_basis": "the handler's own doc comment"          # when that is the source
+```
+
+Keys the handler *reads* are behaviour, not contract: a key can be read and
+ignored, and one validated inside a helper this pass does not follow is missing.
+Treat the inferred list as a strong starting guess, and confirm on a read before
+trusting it on a write.
+
+Two answers were checked against sources outside this code: `kmwan.set_sensitivity`
+yields exactly `sensitivity`, which the UI bundle's call site says, and
+`sms-forward.get_config` yields exactly `modem_mode`, which the router's own error
+message names.
+
 ## Firmware drift
 
 What 4.7.11 → 4.10.1 actually did, measured by probing 110 read-only methods:
@@ -351,8 +407,12 @@ awaits the router loses the race against a closed pipe without it.
 - `wifi.set_config`, firewall rules beyond port forwards, and the VPN modules are
   `rpc_call`-only.
 - Most methods confirmed present have **no parameter documentation** — the UI
-  calls them, nothing describes them. `rpc_call` is guess-and-check against a
-  live router, which is safe for reads and not for writes.
+  calls them, nothing describes them. About half now have names recovered from
+  the firmware's own handlers (see *Where parameters come from*), and the rest
+  are `rpc_call` guess-and-check against a live router, which is safe for reads
+  and not for writes. The 10 ELF handlers (`wg-client.so`, `ovpn-*.so`,
+  `modem.so`, …) are unread: their blobmsg policy tables would name the
+  parameters, but that needs real disassembly.
 - Mesh/EasyMesh, VLAN configuration, the IoT network and GL.iNet Account are
   unmodelled.
 - No tests beyond the smoke test and the checks described above.
