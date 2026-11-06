@@ -260,14 +260,16 @@ def extract_rootfs(image: Path, dest: Path) -> Path:
 
     out = dest / "rootfs"
     if shutil.which("unsquashfs"):
-        # Extract only www/ -- that is all we read, it is far faster than the
-        # whole rootfs, and it sidesteps the one thing that makes unsquashfs
+        # Extract only what the generator reads: www/ for the UI's call sites,
+        # and usr/lib/oui-httpd/rpc for the handler inventory. Far faster than
+        # the whole rootfs, and it sidesteps the one thing that makes unsquashfs
         # unprivileged runs fail: it cannot mknod /dev/console and exits
         # non-zero over it even though everything else extracted fine. If the
-        # path differs on this model, fall back to a full extract and judge
+        # paths differ on this model, fall back to a full extract and judge
         # success by whether content appeared rather than by exit status.
         subprocess.run(["unsquashfs", "-no-progress", "-f", "-d", str(out),
-                        str(carve), "www/*"], capture_output=True)
+                        str(carve), "www/*", "usr/lib/oui-httpd/rpc/*"],
+                       capture_output=True)
         if not js_bundles(out):
             subprocess.run(["unsquashfs", "-no-progress", "-f", "-d", str(out),
                             str(carve)], capture_output=True)
@@ -281,6 +283,32 @@ def extract_rootfs(image: Path, dest: Path) -> Path:
             "cannot unpack the filesystem: need unsquashfs (squashfs-tools) or 7z"
         )
     carve.unlink(missing_ok=True)
+    return out
+
+
+def handler_modules(root: Path) -> set[str]:
+    """
+    Module names the firmware can actually serve, from its rpcd handler files.
+
+    /usr/lib/oui-httpd/rpc holds one object per module: a .so plugin, or a small
+    script for the handful of thin ones. rpcd can only dispatch a module that has
+    a handler here, so this listing answers "does this module exist on this
+    firmware" statically, with no router in the loop -- strictly better evidence
+    than the UI bundles, which keep calling modules a release deleted.
+
+    It is not a substitute for probing methods: a handler can exist and still not
+    implement a given method. It bounds the module set, nothing more.
+    """
+    out = set()
+    for d in root.glob("usr/lib/oui-httpd/rpc"):
+        for path in d.iterdir():
+            name = path.name
+            if name.startswith("lib") or name.endswith(".conf"):
+                continue
+            stem = re.sub(r"\.so(\.[0-9]+)?$", "", name)
+            stem = re.sub(r"\.lua$", "", stem)
+            if stem:
+                out.add(stem)
     return out
 
 
@@ -321,7 +349,8 @@ def load_legacy(path: Path | None) -> dict:
             for mod, m in data.items()}
 
 
-def build(seen: dict[str, dict[str, dict]], legacy: dict) -> tuple[dict, dict]:
+def build(seen: dict[str, dict[str, dict]], legacy: dict,
+          handlers: set[str] | None = None) -> tuple[dict, dict]:
     new: dict[str, dict] = {}
     stats = {"documented": 0, "ui_only": 0, "legacy_only": 0}
 
@@ -401,6 +430,30 @@ def build(seen: dict[str, dict[str, dict]], legacy: dict) -> tuple[dict, dict]:
             for module in group:
                 new[module]["spelling_variants"] = sorted(set(group) - {module})
 
+    # Cross-check every module against the handler files the firmware actually
+    # ships. Two fixes fall out, and one label:
+    #   * a module with no handler cannot be dispatched, so it is not "unconfirmed
+    #     on this firmware", it is impossible -- which is a much stronger statement
+    #     than anything the UI bundles support.
+    #   * if the catalog's name has no handler but its dash/underscore twin does,
+    #     the older catalog simply spelled it wrong; adopt the firmware's spelling
+    #     rather than keeping a name that can never resolve.
+    if handlers:
+        for module in sorted(new):
+            if module in handlers:
+                new[module]["firmware_handler"] = "present"
+                continue
+            twin = module.replace("_", "-") if "_" in module else module.replace("-", "_")
+            if twin in handlers and twin not in new:
+                new[twin] = new.pop(module)
+                new[twin]["firmware_handler"] = "present"
+                new[twin]["renamed_from"] = module
+                new[twin]["note"] = (
+                    f"the older catalog called this {module!r}; the firmware ships "
+                    f"usr/lib/oui-httpd/rpc/{twin}.so")
+            else:
+                new[module]["firmware_handler"] = "absent"
+
     return new, stats
 
 
@@ -434,10 +487,26 @@ def main() -> int:
         print(f"observed in the UI: {sum(len(v) for v in seen.values())} methods "
               f"across {len(seen)} modules")
 
+        handlers = handler_modules(root)
+        print(f"firmware ships rpcd handlers for {len(handlers)} modules")
+
         legacy = load_legacy(args.legacy)
         if legacy:
             print(f"borrowing docs from {args.legacy.name}")
-        catalog, stats = build(seen, legacy)
+        catalog, stats = build(seen, legacy, handlers)
+
+        # The UI is a superset of what the router serves, not a subset. On 4.10.1
+        # it calls 211 methods whose module has no handler at all -- the vendor's
+        # own web UI carries dead code for features this build does not have.
+        dead = sorted(m for m in catalog
+                      if catalog[m].get("firmware_handler") == "absent")
+        if dead:
+            print(f"\n  {len(dead)} catalogued modules have NO rpcd handler on this "
+                  "firmware, so every method under them will fail:")
+            for m in dead:
+                print(f"    {m} ({len(catalog[m]['case_groups_data'])} methods)")
+            print("  They are kept, labelled, because a caller who tries one deserves "
+                  "to learn why it failed without phoning the router.")
 
         # Modules that look like each other's spelling. Some pairs are two real
         # modules; say so without claiming which is which.
