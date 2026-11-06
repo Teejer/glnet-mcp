@@ -1,0 +1,24 @@
+# The method catalog is generated from your own firmware by build_catalog.py.
+# It is not distributed here on purpose: a catalog built against one firmware
+# version is actively misleading on another, and the older published dumps have
+# unclear redistribution terms.
+api_description.json
+api_description*.json.bak
+
+# Generated / scratch
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets. The password lives outside the repo by default
+# (~/.config/opencode/glnet.password); these are here so a well-meaning
+# "just put it next to the script" never reaches a commit.
+*.password
+*.enc
+*.enc.dead
+secrets/
+
+# Firmware images
+*.bin
+*.img
+rootfs/

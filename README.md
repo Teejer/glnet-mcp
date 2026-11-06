@@ -1,0 +1,310 @@
+# glnet-mcp
+
+An MCP server for **GL.iNet routers** (firmware 4.x), speaking the same vendor
+JSON-RPC API the router's own admin panel uses.
+
+It runs on your machine, authenticates as the router's normal web-UI user, and
+installs **nothing on the router** — no SSH keys, no daemon, no agent.
+
+Built and tested against a **GL.iNet GL-BE9300 (Flint 3)**. Most of what is here
+applies to any GL.iNet on firmware 4.x, but see *Firmware drift* — the API moves
+between releases and this project assumes it will.
+
+## Why this exists
+
+GL.iNet published a 4.x API reference at `dev.gl-inet.com` and **took it down in
+January 2024**. It has not come back. What is left is the API the web UI calls,
+which you can observe but not read about, and which changes across releases:
+
+- **4.8** added a `hash-method` field to the login challenge.
+- **4.10** deleted the entire `lan` module and moved DHCP reservations into a new
+  `vlan_subnet` module built around the new 802.1Q VLAN feature.
+
+So the interesting problem here is not "wrap 300 RPC methods". It is how to stay
+useful against an API that is undocumented and moves under you. Two answers:
+
+1. **Generate the method catalog from the firmware you actually run** — see below.
+2. **Say "I don't know" instead of guessing.** Every catalog entry carries its
+   provenance, and a method that only survives from an older catalog is labelled
+   as such rather than presented as fact.
+
+## Install
+
+```bash
+git clone https://github.com/Teejer/glnet-mcp && cd glnet-mcp
+./build_catalog.py ~/Downloads/<your-model>-<version>.bin   # optional, see below
+umask 077 && read -rs pw && printf '%s' "$pw" > glnet.password && echo
+docker build -t glnet-mcp:1.0.0 .
+```
+
+Then point any MCP client at the launcher:
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "glnet": {
+        "type": "local",
+        "command": ["/absolute/path/to/glnet-mcp/glnet-mcp-container.sh"],
+        "timeout": { "startup": 60000 }
+      }
+    }
+  }
+}
+```
+
+Prefer no container? `./glnet-mcp.sh` runs the same server from a venv
+(`uv venv && uv pip install -r requirements.txt`). It is the path I use while
+hacking, so I do not rebuild on every edit.
+
+The catalog step is optional. Without it, every curated tool works and
+`rpc_call` works; only `api_search` is blind, and it says so.
+
+## Generating the catalog
+
+`build_catalog.py` takes a firmware image and finds out, from the router itself,
+which methods exist:
+
+```bash
+./build_catalog.py be9300-4.10.1_release1-1129-0918-1789732857.bin
+```
+
+It locates the squashfs inside the image by parsing superblocks rather than
+trusting a fixed offset, extracts it with `unsquashfs` (or `7z`), and greps the
+web UI's JavaScript bundles for the router's own call convention:
+
+```js
+$("call", ["sid", "vlan_subnet", "add_static_bind", payload])
+```
+
+That yields every `module.method` the UI actually invokes — the best available
+record of what a given firmware really exposes. Pass `--legacy <older.json>` to
+merge parameter documentation from an earlier catalog; those entries come through
+labelled as unverified.
+
+Images are at <https://dl.gl-inet.com/>. **Verify the download against the
+checksum that page publishes.** This script will cheerfully build a catalog out
+of a truncated file.
+
+The catalog is deliberately **not committed here**. Shipping one guarantees it is
+wrong for someone else's firmware, and the older circulated dumps are scrapes of
+GL.iNet's dead documentation site with unclear redistribution terms. Everything
+in this repo is written here; the catalog is a build artifact, like a lockfile.
+
+On a BE9300 running 4.10.1 this produces 347 methods across 51 modules.
+
+## Firmware drift
+
+What 4.7.11 → 4.10.1 actually did, measured by probing 110 read-only methods:
+**57 survived, 53 returned** *Method not found*. Roughly half the API moved.
+
+| 4.7 | 4.10 |
+|---|---|
+| `lan.get_static_bind_list` | `vlan_subnet.get_static_bind_list` — **takes no params object** |
+| `lan.add_static_bind {name,mac,ip}` | `vlan_subnet.add_static_bind {name,mac,ip,hostname,display_name}` |
+| `lan.remove_static_bind {mode,mac}` | `vlan_subnet.remove_static_bind {mode,display_name,mac}` |
+| `lan.get_config_list` | `vlan_subnet.get_subnets` |
+| `total_rx`/`total_tx` integers | same fields, now **strings** |
+
+Two details that cost real time:
+
+- **`get_static_bind_list` takes no third parameter at all.** The UI calls it as
+  `[sid, module, method]`. Sending `{}` happens to work; matching the UI is safer.
+- **Every reservation is scoped to a subnet** via `display_name`, defaulting to
+  `"main"`. On a router with VLANs there is more than one, and a reservation in
+  the wrong subnet is invisible to the one you are looking at.
+
+`KNOWN_SHAPES` in `build_catalog.py` carries parameter shapes transcribed from
+the router's minified UI code, because the UI is the only documentation left. If
+a call fails for you, that dict is where to add what you learned.
+
+## Tools (19)
+
+**Read** — `router_status`, `list_clients`, `client_status`, `arp_table`,
+`lan_config`, `wifi_status`, `list_static_binds`, `list_port_forwards`,
+`session_info`, `api_modules`, `api_search`
+
+**Write** — `add_static_bind`, `modify_static_bind`, `remove_static_bind`,
+`rename_client`, `block_client`, `add_port_forward`, `router_reboot`
+
+**Generic** — `rpc_call`, any method your router exposes
+
+`router_reboot` and `remove_static_bind(all_binds=True)` refuse to run without
+`confirm=True`. `block_client` and `add_port_forward` have no guard — they are
+routine operations — but they do cut a device off and open the firewall,
+respectively. `add_static_bind` always re-reads the list afterwards and returns
+it, because a write's own return value is not proof the write persisted.
+
+## Security notes
+
+**Reads return your Wi-Fi passphrases in cleartext.** `system.get_status`
+includes a `passwd` field for every SSID — main, guest, IoT — as plaintext PSKs,
+not hashes. An agent that dutifully passes router replies into model context is
+therefore publishing your wireless keys into a transcript and a log file.
+
+`redact()` runs inside `GlInet.call()`, the single choke point every reply passes
+through, so a tool added later cannot leak by forgetting to scrub. It matches on
+key name (`passwd`, `password`, `psk`, `private_key`, `secret`, `token`, `pin`,
+`hash`, `sid`…) and leaves identifiers alone — MACs, serials and public keys
+stay, because hiding them costs usability and protects nothing.
+
+It reports what it hid rather than deleting it silently:
+
+```json
+{"wifi": [{"ssid": "Home-2.4G", "passwd": "[redacted passwd]", "up": true}],
+ "_redacted": ["$.wifi[0].passwd", "$.wifi[1].passwd", "..."]}
+```
+
+Silent removal reads identically to "this field never existed", which is worse
+than useless when you are mapping an API. `rpc_call` accepts
+`reveal_secrets=true` for the rare case you need the real value — it then lands
+in the transcript deliberately.
+
+**Not caught:** a private key embedded inside an opaque config *string*, which
+WireGuard and OpenVPN exports do. Key-name matching cannot see into a blob.
+
+**The password is never an environment variable**, because env is readable via
+`docker inspect`. The launcher stages it on tmpfs (`$XDG_RUNTIME_DIR`, dir 700,
+file 600), bind-mounts it read-only, and deletes it on exit.
+
+**TLS verification is off by default** — the router ships a self-signed
+certificate. On a LAN that is a reasonable trade; `GLNET_VERIFY_TLS=1` turns
+verification on if you have pinned the cert.
+
+### Container sandbox
+
+`--read-only` rootfs, `--cap-drop ALL`, `no-new-privileges`, pid and memory
+limits, non-root, tmpfs `/tmp`. The only thing that leaves the container is HTTPS
+to the router.
+
+### TPM2 sealing, and the mistake it taught me
+
+`seal-password.sh` can bind the password to a TPM2 so a stolen disk or an
+off-site backup does not yield it. (It does not protect against a process already
+running as you — that process can run the launcher and get plaintext like anyone
+else.)
+
+It now **refuses to seal** unless `/var/lib/systemd/tpm2/srk.pub` exists. The
+reason is a story:
+
+`systemd-analyze has-tpm2` returning yes does not mean systemd has a *persistent*
+storage root key. On a machine where `systemd-tpm2-setup.service` is inactive —
+and on many setups its `ConditionSecurity=measured-os` is never met, because
+measured boot is not enabled — a seal is made against transient runtime state. It
+decrypts fine for a while. Then that state goes away and the secret is
+**permanently unrecoverable**.
+
+This happened here. A seal was made, a same-session round-trip passed, the
+plaintext was deleted on the strength of it, and about half an hour later the
+router password existed nowhere. `seal-password.sh` now checks for the SRK file
+first, and will not delete a plaintext without an explicit `--delete-plaintext`
+plus a reboot-and-recheck. A round-trip in the same session proves the seal
+works *now*, which is not the claim you are relying on when you delete the
+fallback.
+
+### Lifecycle, and a leak this found
+
+`docker run` has no "exit when the client dies" flag, and this launcher cannot
+background the `docker run` to wait on it: a backgrounded command in a
+non-interactive shell gets stdin from `/dev/null`, and stdin *is* the MCP channel.
+So a launcher killed by `SIGKILL` orphaned its container — and that container
+holds the bind-mounted plaintext password.
+
+This was not theoretical. Four killed test launches left four running containers
+and four plaintext copies of the router password on tmpfs.
+
+Three things handle it now:
+
+- a detached watchdog subshell watches for the launcher's `/proc` entry to vanish
+  and tears the container down behind it. `SIGKILL` reparents the subshell rather
+  than killing it, so it still fires. Verified by `kill -9`.
+- on startup the launcher reaps any `glnet-mcp-<pid>` container whose launcher PID
+  is gone — the PID is in the container name, so liveness is checkable without
+  guessing.
+- staging directories are swept, but **age alone is not proof of death**: the
+  sweep skips any directory still bind-mounted by a running container. The server
+  reads the password lazily at every login, so deleting a live container's staged
+  secret does not free an orphan — it breaks that server's next re-login.
+
+## Findings from a live router
+
+Things that only show up by running this against real hardware:
+
+- `clients.get_list` sends **`name`**, not `hostname`, and **`iface`**, not
+  `interface`. An early version read the wrong keys and silently returned every
+  client with an empty name — no error, just useless output.
+- Most clients have no name. Android 10+ and iOS 14+ use per-network randomised
+  MACs and send no hostname, so `list_clients` reports `random_mac`, which is a
+  hint at device class, not an identification. You cannot single out a specific
+  phone or tablet from the router alone. Turning MAC randomisation off for that
+  network fixes it: the device starts sending a real hostname and a stable OUI.
+- **There is no per-device last-seen timestamp.** `online_time` looks like one and
+  is not — 11 of 12 currently-online devices showed an `online_time` older than 30
+  days. `last_update_rate` is a global stats-refresh stamp, identical for online
+  and offline devices. So "which clients have not connected in months?" has no
+  answer from this API, and `clients.remove_offline` is a sledgehammer: it drops
+  every currently-offline record at once, names and aliases included.
+- No method on 4.7.11 or 4.10.1 lists DHCP leases. `arp_table` is the nearest
+  thing.
+- Replies carry 60-sample `last_rx`/`last_tx` time series per client, which is why
+  `list_clients` projects down to the fields that matter.
+- **Concurrent calls used to produce spurious `-32000` "Access denied".** One
+  session id is shared, and a re-login invalidated the ids other calls were
+  mid-flight with: six parallel calls failed, the same six in series all
+  succeeded. Fixed with a lock around request-and-re-login. If you fork this,
+  note that MCP clients fire tools concurrently by default.
+- **The upgrade check can fail while the UI reports "up to date".**
+  `upgrade.check_firmware_online` returned `no resolver defined to resolve
+  "fw.gl-inet.com"` while `diag.ping fw.gl-inet.com` from the router resolved and
+  answered in 7 ms. The web UI showed that error as "no new firmware" — which is
+  how a box sits 16 months behind with nobody told. Test the check, not the UI.
+
+## Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `GLNET_HOST` | `192.168.8.1` | router address |
+| `GLNET_PORT` | `443` | |
+| `GLNET_USER` | `root` | router admin user |
+| `GLNET_PASSWORD_FILE` | `/run/secrets/glnet.password` in the container, `~/.config/opencode/glnet.password` otherwise | |
+| `GLNET_CATALOG` | `./api_description.json` | generated by `build_catalog.py` |
+| `GLNET_VERIFY_TLS` | `0` | `1` to validate the router certificate |
+| `GLNET_TIMEOUT` | `20` | seconds |
+| `GLNET_MCP_IMAGE` | `glnet-mcp:1.0.0` | |
+
+## Smoke test
+
+```bash
+( printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"p","version":"0"}}}' \
+  '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"router_status","arguments":{}}}';
+  sleep 40 ) | ./glnet-mcp-container.sh
+```
+
+The `sleep` is load-bearing. The server exits on stdin EOF, so a tool call that
+awaits the router loses the race against a closed pipe without it.
+
+## Known gaps
+
+- `wifi.set_config`, firewall rules beyond port forwards, and the VPN modules are
+  `rpc_call`-only.
+- Most methods confirmed present have **no parameter documentation** — the UI
+  calls them, nothing describes them. `rpc_call` is guess-and-check against a
+  live router, which is safe for reads and not for writes.
+- Mesh/EasyMesh, VLAN configuration, the IoT network and GL.iNet Account are
+  unmodelled.
+- No tests beyond the smoke test and the checks described above.
+
+## Related
+
+[openwrt-mcp](https://github.com/GlassOnTin/openwrt-mcp) is the other way to put
+an agent on a GL.iNet: a resident daemon **on** the router, using root SSH plus
+ubus/uci. It is broader — ubus is self-describing, so it does not need a catalog —
+and it is better written than this. It is also a root service on your edge device.
+This project is the lower-privilege option; if you need something the vendor API
+does not expose, reach for that one.
+
+[python-glinet](https://github.com/tomtana/python-glinet) preserved a copy of the
+official 4.x method catalog. `build_catalog.py --legacy` can merge it for
+parameter documentation if you have it.

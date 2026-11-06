@@ -1,0 +1,4 @@
+# Python 3.13 removed the stdlib `crypt` module, and the GL.iNet login
+# handshake needs BSD md5_crypt -- hence passlib rather than stdlib.
+mcp>=2.0.0
+passlib>=1.7.4
