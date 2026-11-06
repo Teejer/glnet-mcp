@@ -30,11 +30,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import ssl
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -86,8 +88,8 @@ class Config:
             return env
         return self._read_password_file()
 
-    def _read_password_file(self) -> str | None:
-        path = self.password_file
+    def _read_password_file(self, path: Path | None = None) -> str | None:
+        path = path or self.password_file
         if not path.exists():
             return None
         mode = path.stat().st_mode & 0o777
@@ -99,6 +101,21 @@ class Config:
                 file=sys.stderr,
             )
         return path.read_text().strip() or None
+
+    @property
+    def luci_password(self) -> str | None:
+        """
+        Credential for LuCI on :8443, which is a separate authentication domain
+        from the JSON-RPC API. Usually the same value; on some setups it is not,
+        which is why it is overridable rather than assumed.
+        """
+        env = os.environ.get("GLNET_LUCI_PASSWORD")
+        if env:
+            return env
+        override = os.environ.get("GLNET_LUCI_PASSWORD_FILE")
+        if override:
+            return self._read_password_file(Path(override))
+        return self.password
 
     @property
     def url(self) -> str:
@@ -934,6 +951,491 @@ def session_info() -> dict:
         "catalog_modules": len(catalog()),
         "tls_verification": CONFIG.verify_tls,
     }
+
+
+# --------------------------------------------------------------------------
+# configuration backup
+#
+# Not a vendor JSON-RPC method: on 4.10.1 (and in the older published catalog)
+# there is no backup method in the API at all. Backup lives in LuCI, a second
+# web UI on port 8443, served by /cgi-bin/cgi-backup -- a symlink to
+# /usr/libexec/cgi-io, which selects its behaviour from argv[0].
+#
+# THE ARCHIVE IS THE SECRET. It contains etc/config/wireless (every Wi-Fi
+# passphrase, in the clear) and /etc/shadow (the root password hash), plus
+# reservations, firewall rules and VPN keys. So these tools are built to never
+# return bytes: they write to disk with mode 0600 and report only metadata.
+# redact() cannot help here -- there is nothing in the payload worth keeping.
+#
+# There is deliberately no restore tool. A restore reboots the router, can lock
+# you out, and is not something to do because a language model asked politely.
+# Do that in the browser, deliberately, at https://<router>:8443/cgi-bin/luci/
+# --------------------------------------------------------------------------
+
+LUCI_PORT = int(os.environ.get("GLNET_LUCI_PORT", "8443"))
+BACKUP_DIR = Path(os.environ.get("GLNET_BACKUP_DIR", "/app/backups"))
+
+# Presence of these is what makes an archive worth trusting. Checked by name
+# only; their contents are never read.
+CRITICAL_MEMBERS = (
+    "etc/config/wireless",   # Wi-Fi passphrases
+    "etc/config/dhcp",       # reservations
+    "etc/config/firewall",   # port forwards, zones
+    "etc/config/network",    # addressing
+    "etc/shadow",            # root password hash
+)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """The LuCI login answer is a 302 that carries the session cookie. Following
+    it would hand us the page instead of the credential."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802
+        return None
+
+
+def _luci_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=ROUTER._ssl), _NoRedirect()
+    )
+
+
+def _luci_session() -> str:
+    """
+    Authenticate to LuCI and return the sysauth_https token.
+
+    Separate credential domain from the JSON-RPC API: same username, but a
+    different UI, a different port and its own session. On some setups the LuCI
+    password is not the admin password the API uses -- point
+    GLNET_LUCI_PASSWORD_FILE at it if so.
+    """
+    password = CONFIG.luci_password
+    if not password:
+        raise RouterError(
+            -1,
+            "no password available for LuCI. Set GLNET_LUCI_PASSWORD_FILE, or the "
+            "same password file the API uses.",
+        )
+    body = urllib.parse.urlencode(
+        {"luci_username": CONFIG.user, "luci_password": password}
+    ).encode()
+    req = urllib.request.Request(
+        f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/luci/",
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/luci/",
+        },
+        method="POST",
+    )
+    try:
+        with _luci_opener().open(req, timeout=CONFIG.timeout) as resp:
+            raw = resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as exc:
+        raw = exc.headers.get_all("Set-Cookie") or [] if exc.headers else []
+        if not raw:
+            raise RouterError(
+                -1,
+                f"LuCI login failed with HTTP {exc.code} and set no session cookie. "
+                f"LuCI on :{LUCI_PORT} likely has its own password, distinct from the "
+                f"API password -- set GLNET_LUCI_PASSWORD_FILE.",
+            ) from exc
+    except urllib.error.URLError as exc:
+        raise RouterError(
+            -1, f"cannot reach LuCI on {CONFIG.host}:{LUCI_PORT}: {exc.reason}"
+        ) from exc
+
+    for cookie in raw:
+        name, _, value = cookie.partition(";")[0].partition("=")
+        if name.strip() == "sysauth_https":
+            return value.strip()
+    raise RouterError(-1, "LuCI set no sysauth_https cookie; login did not succeed")
+
+
+def _describe_archive(path: Path) -> dict:
+    """Metadata about an archive. Names only -- contents are never read."""
+    import hashlib
+    import tarfile
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    out: dict = {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": digest.hexdigest(),
+        "mode": oct(path.stat().st_mode & 0o777),
+    }
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            names = set(tar.getnames())
+        out["entries"] = len(names)
+        out["critical_files_present"] = [m for m in CRITICAL_MEMBERS if m in names]
+        out["critical_files_missing"] = [m for m in CRITICAL_MEMBERS if m not in names]
+    except Exception as exc:  # noqa: BLE001 - a bad archive is an answer, not a crash
+        out["error"] = f"not a readable gzip tar: {type(exc).__name__}: {exc}"
+    return out
+
+
+# --------------------------------------------------------------------------
+# restore
+#
+# The LuCI ACL for this firmware is an exact argv allowlist, read from
+# /usr/share/rpcd/acl.d/luci-mod-system.json inside the firmware image and then
+# confirmed call by call against the live router:
+#
+#   exec  /bin/tar -tzf /tmp/backup.tar.gz                        allowed
+#   exec  /sbin/sysupgrade --restore-backup /tmp/backup.tar.gz    allowed
+#   exec  /sbin/sysupgrade --help                                 DENIED (argv not listed)
+#   write /tmp/backup.tar.gz   via cgi-io upload                  allowed
+#   write /tmp/glnet-probe.txt via cgi-io upload                  DENIED (path not listed)
+#   read  /proc/uptime                                            DENIED (path not listed)
+#   read  /proc/sys/kernel/hostname                               allowed
+#
+# That is why the remote path is a constant rather than a parameter, and why
+# every argv below is built from literals. rpcd's file.exec is root command
+# execution gated only by that list, so a tool taking a command string would be
+# a remote root shell with an MCP schema around it. Nothing here accepts one.
+# --------------------------------------------------------------------------
+
+REMOTE_ARCHIVE = "/tmp/backup.tar.gz"   # the only writable staging path
+CMD_VALIDATE = ("/bin/tar", ["-tzf", REMOTE_ARCHIVE])
+CMD_RESTORE = ("/sbin/sysupgrade", ["--restore-backup", REMOTE_ARCHIVE])
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024     # a config backup is ~460 KB; more is a mistake
+
+
+def _luci_rpc(token: str, method: str, args: dict) -> dict:
+    """
+    One rpcd call over LuCI's ubus bridge, returning the payload.
+
+    admin/ubus sits under the session cookie's Path, so the cookie authenticates
+    it -- the opposite of /cgi-bin/cgi-*, which the cookie cannot reach and which
+    therefore needs the session as a body field.
+    """
+    req = urllib.request.Request(
+        f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/luci/admin/ubus",
+        data=json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "call",
+            "params": [token, "file", method, args],
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Cookie": f"sysauth_https={token}",
+        },
+        method="POST",
+    )
+    try:
+        with _luci_opener().open(req, timeout=CONFIG.timeout) as resp:
+            body = json.loads(resp.read().decode(errors="replace"))
+    except urllib.error.HTTPError as exc:
+        raise RouterError(-1, f"LuCI ubus returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RouterError(-1, f"cannot reach LuCI ubus: {exc.reason}") from exc
+    except ValueError as exc:
+        raise RouterError(-1, f"LuCI ubus returned non-JSON: {exc}") from exc
+
+    if "error" in body:
+        raise RouterError(-1, f"LuCI ubus: {body['error'].get('message')}")
+    result = body.get("result") or []
+    code = result[0] if result else 0
+    payload = result[1] if len(result) > 1 else {}
+    if code == 6:
+        raise RouterError(
+            -1, "LuCI refused this call (rpcd ACL). The ACL is an exact argv "
+                "allowlist; compare the command and path with "
+                "/usr/share/rpcd/acl.d/luci-mod-system.json on the router.",
+        )
+    if code == 4:
+        raise RouterError(-1, f"{args.get('path', '?')} does not exist on the router")
+    if code != 0:
+        raise RouterError(-1, f"LuCI rpcd returned code {code}")
+    return payload
+
+
+def _luci_upload(token: str, local: Path) -> dict:
+    """
+    PUT a local archive at the router's /tmp/backup.tar.gz.
+
+    cgi-io reports back the size and the sha256 it computed, so the transfer can
+    be verified against what we intended to send instead of merely trusted.
+    """
+    boundary = f"glnet{os.urandom(12).hex()}"
+    head = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="sessionid"\r\n\r\n'
+        f"{token}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="filename"\r\n\r\n'
+        f"{REMOTE_ARCHIVE}\r\n"
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="filedata"; '
+        f'filename="{local.name}"\r\n'
+        "Content-Type: application/octet-stream\r\n\r\n"
+    ).encode()
+    tail = f"\r\n--{boundary}--\r\n".encode()
+    with open(local, "rb") as fh:
+        payload = head + fh.read() + tail
+
+    req = urllib.request.Request(
+        f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/cgi-upload",
+        data=payload,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Referer": f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/luci/",
+        },
+        method="POST",
+    )
+    try:
+        with _luci_opener().open(req, timeout=max(CONFIG.timeout, 120)) as resp:
+            text = resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200] if exc.fp else ""
+        raise RouterError(-1, f"upload HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RouterError(-1, f"cannot reach LuCI upload endpoint: {exc.reason}") from exc
+
+    try:
+        report = json.loads(text)
+    except ValueError:
+        raise RouterError(-1, f"upload reply was not JSON: {text[:200]}") from exc
+    if "sha256sum" not in report:
+        raise RouterError(-1, f"upload reported no checksum: {text[:200]}")
+    return report
+
+
+def _luci_cleanup(token: str) -> bool:
+    """Delete the staging archive. Best effort; a reboot clears /tmp anyway."""
+    try:
+        _luci_rpc(token, "remove", {"path": REMOTE_ARCHIVE})
+        return True
+    except RouterError:
+        return False
+
+
+def _fetch_backup(dest_dir: str = "", label: str = "",
+                  token: str | None = None) -> dict:
+    """
+    Pull the running configuration archive from the router onto disk.
+
+    Returns metadata only -- the archive is nothing but secrets. `token` may be
+    passed in so a caller that already authenticated does not log in twice.
+    """
+    if token is None:
+        token = _luci_session()
+    out_dir = Path(dest_dir) if dest_dir else BACKUP_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(out_dir, 0o700)
+
+    stamp = time.strftime("%Y-%m-%d")
+    tag = f"-{re.sub(r'[^A-Za-z0-9._-]', '', label)}" if label else ""
+    dest = out_dir / f"backup-{CONFIG.host}-{stamp}{tag}.tar.gz"
+
+    req = urllib.request.Request(
+        f"https://{CONFIG.host}:{LUCI_PORT}/cgi-bin/cgi-backup",
+        data=f"sessionid={token}".encode(),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with _luci_opener().open(req, timeout=max(CONFIG.timeout, 120)) as resp:
+            head = resp.read(2)
+            if head != b"\x1f\x8b":
+                rest = resp.read(200)
+                raise RouterError(
+                    -1,
+                    "cgi-backup did not return an archive: "
+                    f"{(head + rest).decode(errors='replace')[:160]}",
+                )
+            # 0600 from the moment the file exists, not chmod after the fact.
+            fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(head)
+                shutil.copyfileobj(resp, fh)
+    except urllib.error.HTTPError as exc:
+        raise RouterError(-1, f"cgi-backup returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RouterError(-1, f"cannot reach LuCI: {exc.reason}") from exc
+
+    info = _describe_archive(dest)
+    info["note"] = ("archive written to disk with mode 0600; contents intentionally "
+                    "not returned -- they are all secret")
+    return info
+
+
+@mcp.tool()
+@tool_safe
+def backup_config(dest_dir: str = "", label: str = "") -> dict:
+    """
+    Download a configuration backup from the router and save it to disk.
+
+    Returns ONLY metadata -- path, size, sha256, entry count, which critical
+    files are inside. The archive itself holds every Wi-Fi passphrase and the
+    root password hash, so it is never returned, quoted, or summarised by
+    content. Do not ask for the bytes; open the file locally if you need them.
+
+    Written with mode 0600 for that reason. Keep it out of synced folders, and
+    never attach one to a bug report.
+
+    This reads the router; it changes nothing. The counterpart, restore_config,
+    replaces everything and reboots -- read that one's warning before using it.
+    """
+    return _fetch_backup(dest_dir, label)
+
+
+@mcp.tool()
+@tool_safe
+def restore_config(path: str, sha256: str, confirm: bool = False) -> dict:
+    """
+    Restore a configuration archive onto the router.
+
+    *** THIS REPLACES THE RUNNING CONFIGURATION AND REBOOTS THE ROUTER. ***
+
+    Every connection through it drops -- other hosts on the LAN, DNS, VPN, any
+    service you run behind it, and this MCP session's own network path. Expect
+    several minutes offline. A restore with the wrong archive, or one saved from
+    a very different firmware, can leave the box unreachable, and recovering
+    then means physical access: failsafe mode and a TFTP or sysupgrade flash.
+
+    Without confirm=True nothing is changed. That call still uploads, has the
+    router verify the archive, and deletes it again -- it is a real rehearsal, not
+    a promise, and it is the most this can be tested without an outage.
+
+    `sha256` is required and must be the hash of the file you are restoring. It
+    is checked three times: against the local file, against what the router
+    computes after receiving it, and again before the restore is dispatched. The
+    point is not ceremony -- it is that a caller cannot restore a file it has not
+    first looked at, which is the failure mode of a model guessing a filename.
+
+    A safety backup of the current configuration is taken automatically first and
+    its path is returned, so the state you are leaving is recoverable.
+
+    Everything the router accepts here is fixed: the staging path is always
+    /tmp/backup.tar.gz and the command is always
+    `/sbin/sysupgrade --restore-backup /tmp/backup.tar.gz`, because the router's
+    ACL permits no other invocation. There is no way to ask it for anything else.
+    """
+    local = Path(path)
+    if not local.is_file():
+        return {"aborted": True, "reason": f"no such file: {path}",
+                "hint": "backup_config and inspect_backup report the paths they wrote"}
+
+    want = (sha256 or "").strip().lower()
+    if len(want) != 64 or any(c not in "0123456789abcdef" for c in want):
+        return {"aborted": True,
+                "reason": "sha256 must be the archive's full 64-character hash",
+                "hint": "call inspect_backup or backup_config and pass the sha256 it returns"}
+
+    info = _describe_archive(local)
+    if "error" in info:
+        return {"aborted": True, "reason": info["error"], "archive": info}
+    if info["sha256"] != want:
+        return {"aborted": True,
+                "reason": "the file is not the archive that hash belongs to",
+                "asked_for": want, "this_file_is": info["sha256"], "path": str(local)}
+    if info["bytes"] > MAX_UPLOAD_BYTES:
+        return {"aborted": True,
+                "reason": f"archive is {info['bytes']} bytes; a config backup is far "
+                          "smaller. This looks like a firmware image, not a backup."}
+    if info.get("critical_files_missing"):
+        return {"aborted": True,
+                "reason": "archive lacks files a restore needs; restoring it would "
+                          "leave those subsystems at defaults",
+                "missing": info["critical_files_missing"]}
+
+    token = _luci_session()
+
+    # Insurance first: capture the state being replaced, while it still exists.
+    try:
+        safety = _fetch_backup(label="pre-restore", token=token)
+        safety_out = {"pre_restore_backup": safety["path"],
+                      "pre_restore_sha256": safety["sha256"]}
+    except RouterError as exc:
+        safety_out = {"pre_restore_backup": None,
+                      "warning": f"no safety copy of the current config: {exc.message}"}
+
+    report = _luci_upload(token, local)
+    router_hash = str(report.get("sha256sum", "")).lower()
+    if router_hash != want:
+        _luci_cleanup(token)
+        return {"aborted": True,
+                "reason": "the router computed a different sha256 than the file we sent",
+                "sent": want, "router_sees": router_hash,
+                "action_taken": "staging archive deleted, nothing restored"}
+
+    check = _luci_rpc(token, "exec", {"command": CMD_VALIDATE[0],
+                                      "params": CMD_VALIDATE[1]})
+    if check.get("code") != 0:
+        _luci_cleanup(token)
+        return {"aborted": True,
+                "reason": "the router cannot read the archive it received",
+                "tar": {"code": check.get("code"),
+                        "stderr": str(check.get("stderr", ""))[:300]},
+                "action_taken": "staging archive deleted, nothing restored"}
+
+    if not confirm:
+        removed = _luci_cleanup(token)
+        return {
+            "rehearsal_only": True,
+            "reason": "confirm=True not passed, so nothing was restored",
+            "verified": {
+                "local_sha256": info["sha256"],
+                "router_sha256": router_hash,
+                "entries": info["entries"],
+                "router_can_read_archive": True,
+            },
+            **safety_out,
+            "staging_archive_removed": removed,
+            "would_run": " ".join([CMD_RESTORE[0], *CMD_RESTORE[1]]),
+            "what_happens_next": (
+                "Calling again with confirm=True replaces the running config and "
+                "reboots the router. Several minutes of no network for everything "
+                "behind it. If the restored config changes the LAN address, the "
+                "router may not be reachable at the address you know it by."
+            ),
+        }
+
+    try:
+        result = _luci_rpc(token, "exec", {"command": CMD_RESTORE[0],
+                                           "params": CMD_RESTORE[1]})
+        return {"restore_completed_cleanly": True, "reply": result, **safety_out,
+                "next": "the router is rebooting; do not power-cycle it"}
+    except RouterError as exc:
+        # A dropped connection here is the expected outcome: sysupgrade reboots
+        # the box mid-request, so the reply never arrives. A refusal is different
+        # and must not be mistaken for success.
+        refused = ("refused" in exc.message or "returned code" in exc.message
+                   or "ubus:" in exc.message)
+        if refused:
+            return {"aborted": True, "restored": False,
+                    "reason": f"the router rejected the restore: {exc.message}",
+                    **safety_out,
+                    "action_taken": "staging archive left in /tmp; reboot or "
+                                    "restore_config again clears it"}
+        return {"restore_initiated": True, "restored": "unknown", **safety_out,
+                "reason": f"the connection to the router ended during the restore: "
+                          f"{exc.message}",
+                "next": ("this is what a successful restore looks like from here -- "
+                         "sysupgrade reboots the router before it can answer. Wait "
+                         "several minutes, then check reachability before anything "
+                         "else. Do not power-cycle.")}
+
+
+@mcp.tool()
+@tool_safe
+def inspect_backup(path: str) -> dict:
+    """
+    Report what a saved backup archive contains: size, sha256, entry count and
+    whether the critical config files are inside. Metadata only; the contents
+    are never read or returned.
+
+    Use it to answer "is this backup any good?" without putting Wi-Fi keys or the
+    root hash in front of a model.
+    """
+    target = Path(path)
+    if not target.is_file():
+        return {"error": f"no such file: {path}"}
+    return _describe_archive(target)
 
 
 if __name__ == "__main__":

@@ -57,9 +57,77 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUT = HERE / "api_description.json"
 
-# ["sid","vlan_subnet","add_static_bind"   -- the router's own call convention.
-# Minification changes the surrounding variable names but not this shape.
-CALL_RE = re.compile(r'\[\s*"sid"\s*,\s*"([a-z0-9_-]+)"\s*,\s*"([a-z0-9_]+)"')
+# ["sid","vlan_subnet","add_static_bind",t]   -- the router's own call convention.
+# Minification changes the surrounding variable names but not this shape. Group 3
+# captures the payload argument as written: "{}", a bare variable, or nothing at
+# all when the UI calls the method with only three elements.
+CALL_RE = re.compile(
+    r'\[\s*"sid"\s*,\s*"([a-z0-9_-]+)"\s*,\s*"([a-z0-9_]+)"'
+    r'(?:\s*,\s*([^\]\n]{0,80}))?\s*\]'
+)
+
+# The minified API wrapper that contains a call site, e.g. addPeer:function(t){...}
+# When the payload is a variable rather than a literal, this name is the handle
+# for finding the caller that actually constructs it.
+WRAPPER_RE = re.compile(r'([A-Za-z_$][\w$]{2,40})\s*:\s*function')
+
+
+def classify(arg: str | None) -> tuple[str, str]:
+    """
+    (arg_style, arg_expr) from how the UI writes the call.
+
+    This matters more than it looks: "the router calls this with three elements
+    and no payload" is a fact you can only get from the UI, and it is what makes
+    a method safe to invoke without guessing arguments. Sending {} to something
+    that validates its arguments can fail; sending nothing at all to
+    get_static_bind_list on 4.10 is what the UI actually does.
+    """
+    if arg is None or not arg.strip():
+        return "none", ""
+    text = arg.strip().rstrip(",").strip()
+    if text == "{}":
+        return "empty_object", "{}"
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", text):
+        return "variable", text
+    return "expression", text[:80]
+
+
+def ui_calls(root: Path) -> dict[str, dict[str, dict]]:
+    """
+    Every module.method the router's own UI invokes, with how it calls it.
+    """
+    found: dict[str, dict[str, dict]] = {}
+    bundles = js_bundles(root)
+    if not bundles:
+        raise BuildError("no JavaScript bundles found -- extraction went wrong?")
+    for path in bundles:
+        try:
+            if path.suffix == ".gz":
+                with gzip.open(path, "rt", errors="replace") as fh:
+                    text = fh.read()
+            else:
+                text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for module, method, arg in CALL_RE.findall(text):
+            entry = found.setdefault(module, {}).setdefault(method, {})
+            style, expr = classify(arg)
+            # If one bundle calls it with {} and another passes a payload, the
+            # payload is the truth -- record the more informative of the two.
+            rank = {"none": 0, "empty_object": 1, "variable": 2, "expression": 3}
+            if rank[style] > rank.get(entry.get("arg_style", ""), -1):
+                # Find the wrapper function this call sits inside.
+                at = text.find(f'"{module}","{method}"')
+                wrappers = WRAPPER_RE.findall(text[max(0, at - 220):at])
+                entry["arg_style"] = style
+                entry["arg_expr"] = expr
+                entry["ui_api"] = wrappers[-1] if wrappers else ""
+    if not found:
+        raise BuildError(
+            "bundles contained no [\"sid\", module, method] calls -- "
+            "GL.iNet may have changed the call convention; extend CALL_RE"
+        )
+    return found
 
 SQUASHFS_MAGIC = b"hsqs"
 
@@ -229,31 +297,6 @@ def js_bundles(root: Path) -> list[Path]:
     return list(root.rglob("*.js")) + list(root.rglob("*.js.gz"))
 
 
-def ui_calls(root: Path) -> dict[str, set[str]]:
-    """Every module.method the router's own UI invokes."""
-    found: dict[str, set[str]] = {}
-    bundles = js_bundles(root)
-    if not bundles:
-        raise BuildError("no JavaScript bundles found -- extraction went wrong?")
-    for path in bundles:
-        try:
-            if path.suffix == ".gz":
-                with gzip.open(path, "rt", errors="replace") as fh:
-                    text = fh.read()
-            else:
-                text = path.read_text(errors="replace")
-        except OSError:
-            continue
-        for module, method in CALL_RE.findall(text):
-            found.setdefault(module, set()).add(method)
-    if not found:
-        raise BuildError(
-            "bundles contained no [\"sid\", module, method] calls -- "
-            "GL.iNet may have changed the call convention; extend CALL_RE"
-        )
-    return found
-
-
 # --------------------------------------------------------------------------
 # building the catalog
 # --------------------------------------------------------------------------
@@ -278,7 +321,7 @@ def load_legacy(path: Path | None) -> dict:
             for mod, m in data.items()}
 
 
-def build(seen: dict[str, set[str]], legacy: dict) -> tuple[dict, dict]:
+def build(seen: dict[str, dict[str, dict]], legacy: dict) -> tuple[dict, dict]:
     new: dict[str, dict] = {}
     stats = {"documented": 0, "ui_only": 0, "legacy_only": 0}
 
@@ -287,6 +330,7 @@ def build(seen: dict[str, set[str]], legacy: dict) -> tuple[dict, dict]:
         borrow = legacy.get(normalise(module), {})
         known = KNOWN_SHAPES.get(module, {})
         for method in sorted(seen[module]):
+            callsite = seen[module][method]
             prior = borrow.get(method)
             had_docs = bool(prior and (prior.get("data") or {}).get("desp"))
             entry = dict(prior) if prior else {"data": {"desp": ""}}
@@ -311,6 +355,14 @@ def build(seen: dict[str, set[str]], legacy: dict) -> tuple[dict, dict]:
                     separators=(",", ":"),
                 )
                 entry["source"] = "this firmware's UI, shape read from the UI bundle"
+            # How the UI calls it. Recorded even when the parameter list is
+            # unknown, because "the UI passes nothing" is itself actionable.
+            if callsite.get("arg_style"):
+                entry["arg_style"] = callsite["arg_style"]
+                if callsite.get("arg_expr"):
+                    entry["arg_expr"] = callsite["arg_expr"]
+                if callsite.get("ui_api"):
+                    entry["ui_api"] = callsite["ui_api"]
             entries[method] = entry
         new[module] = {"case_groups_data": entries}
 

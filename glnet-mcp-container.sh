@@ -150,6 +150,12 @@ else
   echo "glnet-mcp: build one:  ./build_catalog.py <firmware.bin>" >&2
 fi
 
+# Backups land on the host, not in the container: the rootfs is read-only and an
+# archive that vanishes with the container is worthless. Mode 700 because the
+# contents are every Wi-Fi passphrase plus the router's root password hash.
+BACKUP_HOST_DIR="${GLNET_BACKUP_HOST_DIR:-$DIR/backups}"
+mkdir -p "$BACKUP_HOST_DIR" && chmod 700 "$BACKUP_HOST_DIR"
+
 # Watchdog. docker has no "exit when the client dies" flag, and this launcher
 # cannot background `docker run` in order to wait on it -- a backgrounded
 # command in a non-interactive shell gets stdin from /dev/null, which is the
@@ -187,6 +193,8 @@ docker run -i --rm \
   --env GLNET_HOST="${GLNET_HOST:-192.168.8.1}" \
   --env GLNET_USER="${GLNET_USER:-root}" \
   --env GLNET_PASSWORD_FILE=/run/secrets/glnet.password \
+  --env GLNET_BACKUP_DIR=/app/backups \
+  --mount "type=bind,src=$BACKUP_HOST_DIR,dst=/app/backups" \
   --mount "type=bind,src=$STAGED,dst=/run/secrets/glnet.password,readonly" \
   ${CATALOG_MOUNT:+"$CATALOG_MOUNT"} \
   "$IMAGE" "$@"
