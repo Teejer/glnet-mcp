@@ -278,6 +278,19 @@ Things that only show up by running this against real hardware:
   table lives in `/usr/share/rpcd/acl.d/luci-mod-system.json` inside the
   firmware image. Every refusal is the bare integer `6`, which means
   `PermissionError` only if you happen to know LuCI's `fs.js` says so.
+- **`wg-client` and `wg_client` are two different live modules.** Not spellings
+  of one name: `wg_client.get_max_client` returns data while
+  `wg-client.get_max_client` is Method not found, and `wg-client.add_config` is
+  live where `wg_client.add_config` is not. `vlan_subnet` and `parental-control`
+  in the same API show that the separator is just part of the name. Anything you
+  write that treats `-` and `_` as interchangeable will silently merge two
+  modules' documentation. Ask the router instead — `verify_modules.py` found 50
+  live modules, 15 with no answering getter, and 3 it could not probe, out of 68.
+- **An argument error is a successful response.** GL.iNet returns
+  `{"err_msg":"parameter missing","err_code":20001011}` over a normal 200 with no
+  JSON-RPC error. So "the call did not raise" does not mean "nothing happened" —
+  for a write method it can equally mean the write worked. Probe read verbs, or
+  diff a config backup afterwards.
 
 ## Scripts
 
@@ -289,6 +302,7 @@ and none of them requiring SSH:
 | `build_catalog.py` | generate `api_description.json` from a firmware image |
 | `backup_config.sh` | same backup as `backup_config`, from a shell; `--verify` checks an existing archive |
 | `snapshot_state.py` | record 17 readable config methods to `snapshots/`, and `--diff` against the previous one |
+| `verify_modules.py` | ask the router, once per module, whether that module exists — and per method with `--module X --methods` |
 
 `snapshot_state.py` is the one that pays for itself. Run it before probing an
 undocumented method, run it again afterwards, and you know within seconds whether

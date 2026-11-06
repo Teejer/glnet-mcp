@@ -356,7 +356,21 @@ def catalog() -> dict:
 
 
 def find_method(module: str, method: str) -> dict | None:
-    return catalog().get(module, {}).get("case_groups_data", {}).get(method)
+    """
+    Look a method up, tolerating a dash/underscore slip in the module name.
+
+    Exact spelling wins, always. The fallback exists because the wire names are
+    inconsistent across the API -- vlan_subnet and wg-client are both correct --
+    so a caller typing wg_server is one character from a hit. When both spellings
+    are in the catalog the exact one is used even if it is the stale one: the
+    router should get to say that, not the catalog guessing on its behalf.
+    """
+    cat = catalog()
+    bucket = cat.get(module)
+    if bucket is None:
+        twin = module.replace("-", "_") if "-" in module else module.replace("_", "-")
+        bucket = cat.get(twin)
+    return (bucket or {}).get("case_groups_data", {}).get(method)
 
 
 def _uncertain(source: str) -> bool:
@@ -389,7 +403,10 @@ def hint_for(module: str, method: str) -> str:
         return (f"{method} is in the catalog but was not seen in this firmware's "
                 f"UI, so it may have been removed or renamed. Try api_search for "
                 f"the replacement, or rebuild the catalog from your firmware.")
-    return f"catalog example: {entry.get('in_example', 'n/a')}"
+    example = entry.get("in_example")
+    if example:
+        return f"catalog example: {example}"
+    return how_to_call(module, method, entry)
 
 
 # --------------------------------------------------------------------------
@@ -557,6 +574,40 @@ def api_modules() -> dict:
     }
 
 
+def how_to_call(module: str, method: str, entry: dict) -> str:
+    """
+    One line saying what to actually send, derived from how the router's own UI
+    calls this method.
+
+    This is the single most useful thing the catalog knows and it is only
+    obtainable from the firmware: whether a method takes a params object at all.
+    On 4.10.1, get_static_bind_list is called as [sid, module, method] with no
+    third element, and 153 other methods are called with an explicit {}. Guessing
+    wrong on the first is a validation error that reads like a broken method.
+    """
+    style = entry.get("arg_style", "")
+    if style == "none":
+        return (f'no params object at all -- send ["<sid>", "{module}", '
+                f'"{method}"] exactly as three elements')
+    if style == "empty_object":
+        return f'send {{}} as the params object -- ["<sid>", "{module}", "{method}", {{}}]'
+    if style in ("variable", "expression"):
+        api = entry.get("ui_api")
+        where = f" in {api}()" if api else " elsewhere in the calling view"
+        keys = [p.get("keyName") for p in entry.get("params", []) if p.get("keyName")]
+        if keys:
+            return ("needs a payload with " + ", ".join(keys)
+                    + f" -- the router's UI builds it{where}")
+        return (f"needs a payload the UI builds{where}; the parameter names are "
+                "not documented -- read the UI bundle, or send a minimal object "
+                "and let the router report what is missing")
+    if entry.get("params"):
+        return ("parameters: " + ", ".join(
+            f"{p.get('keyName')}:{p.get('dataType__name') or '?'}"
+            for p in entry["params"]))
+    return "argument shape unknown -- the UI never calls it, so nothing observed it"
+
+
 @mcp.tool()
 @tool_safe
 def api_search(query: str, limit: int = 15) -> dict:
@@ -573,6 +624,10 @@ def api_search(query: str, limit: int = 15) -> dict:
     be the arbiter. If no catalog has been generated, every search comes back
     empty and the note tells you how to build one.
 
+    Each hit also carries `how_to_call`: whether the method takes no params
+    object, an empty one, or a payload, and where the UI builds that payload. That
+    is observed from the firmware's own JavaScript, not guessed.
+
     Matching is token-wise and underscore-insensitive, so "static bind" finds
     add_static_bind and "port forward" finds add_port_forward.
     """
@@ -582,6 +637,11 @@ def api_search(query: str, limit: int = 15) -> dict:
 
     scored: list[tuple[int, dict]] = []
     for mod, data in catalog().items():
+        # Another module whose name differs only by dash/underscore. Not a reason
+        # to rank it lower -- wg-client and wg_client are two live modules with
+        # disjoint methods -- but worth surfacing, because typing the wrong
+        # separator gets a Method not found that looks like a missing feature.
+        variants = data.get("spelling_variants") or []
         for name, entry in data.get("case_groups_data", {}).items():
             desp = ((entry.get("data") or {}).get("desp", "") or "").lower()
             # Underscores and hyphens in identifiers are word boundaries to a
@@ -598,27 +658,32 @@ def api_search(query: str, limit: int = 15) -> dict:
             if name.lower() == query.lower().replace(" ", "_"):
                 score += 10
             source = entry.get("source", "")
+            style = entry.get("arg_style", "")
             # A method the 4.10.1 UI really calls is known to exist; one left
             # over from the 4.7 snapshot is a guess. Rank guesses below facts and
             # say which is which, so a stale hit cannot read like a live one.
             if _uncertain(source):
                 score -= 6
-            scored.append(
-                (
-                    score,
-                    {
-                        "module": mod,
-                        "method": name,
-                        "description": ((entry.get("data") or {}).get("desp", "") or ""),
-                        "params": [
-                            {"name": p.get("keyName"), "type": p.get("dataType__name")}
-                            for p in entry.get("params", [])
-                        ],
-                        "example": entry.get("in_example"),
-                        "source": source or "unknown vintage",
-                    },
-                )
-            )
+            hit = {
+                "module": mod,
+                "method": name,
+                "description": ((entry.get("data") or {}).get("desp", "") or ""),
+                "params": [
+                    {"name": p.get("keyName"), "type": p.get("dataType__name")}
+                    for p in entry.get("params", [])
+                ],
+                "example": entry.get("in_example"),
+                "how_to_call": how_to_call(mod, name, entry),
+                "arg_style": style or "unknown",
+                "source": source or "unknown vintage",
+            }
+            if variants:
+                hit["also_exists_as"] = variants
+                hit["spelling_warning"] = (
+                    f"the wire name is exactly {mod!r}; "
+                    f"{', '.join(repr(v) for v in variants)} "
+                    "is a different module, not a spelling of this one")
+            scored.append((score, hit))
 
     scored.sort(key=lambda pair: (-pair[0], pair[1]["module"], pair[1]["method"]))
     hits = [h for _, h in scored[:limit]]
@@ -1436,6 +1501,43 @@ def inspect_backup(path: str) -> dict:
     if not target.is_file():
         return {"error": f"no such file: {path}"}
     return _describe_archive(target)
+
+
+# Every tool this server is meant to expose, spelled out on purpose.
+#
+# The surface can change without the count changing: a helper inserted above
+# api_search once inherited its @mcp.tool() decorator, so api_search vanished and
+# a helper taking an undocumented dict argument appeared in its place, while
+# tools/list still reported 22 tools and nothing looked wrong. Compare the set,
+# not the size.
+EXPECTED_TOOLS = frozenset({
+    "add_port_forward", "add_static_bind", "api_modules", "api_search",
+    "arp_table", "backup_config", "block_client", "client_status",
+    "inspect_backup", "lan_config", "list_clients", "list_port_forwards",
+    "list_static_binds", "modify_static_bind", "remove_static_bind",
+    "rename_client", "restore_config", "router_reboot", "router_status",
+    "rpc_call", "session_info", "wifi_status",
+})
+
+
+def _check_surface() -> None:
+    import asyncio
+    try:
+        names = {t.name for t in asyncio.run(mcp.list_tools())}
+    except Exception as exc:  # noqa: BLE001 - do not block startup over the check
+        print(f"glnet-mcp: tool surface check skipped ({exc})", file=sys.stderr)
+        return
+    missing = sorted(EXPECTED_TOOLS - names)
+    extra = sorted(names - EXPECTED_TOOLS)
+    if missing or extra:
+        raise RuntimeError(
+            "tool surface does not match EXPECTED_TOOLS -- "
+            f"missing={missing} unexpected={extra}. A decorator is probably on "
+            "the wrong function."
+        )
+
+
+_check_surface()
 
 
 if __name__ == "__main__":

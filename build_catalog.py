@@ -370,8 +370,17 @@ def build(seen: dict[str, dict[str, dict]], legacy: dict) -> tuple[dict, dict]:
     # 4.10.1, network.get_arp_list is provably alive and appears nowhere in it --
     # so absence from the UI is not proof of removal. Flag them instead of
     # silently promoting or dropping them.
+    #
+    # Merged by exact module name, deliberately. A dash and an underscore are not
+    # interchangeable here: wg_client.get_max_client returns real data while
+    # wg-client.get_max_client is Method not found, and wg-client.add_config is
+    # live where wg_client.add_config is absent. They are two different modules
+    # that happen to look like spellings of each other, so folding one into the
+    # other parks documentation on methods that do not exist there. The older
+    # catalog uses underscores throughout, which is a no-op for these names.
     for mod, methods in legacy.items():
-        bucket = new.setdefault(mod, {"case_groups_data": {}})
+        real = mod
+        bucket = new.setdefault(real, {"case_groups_data": {}})
         for method, entry in methods.items():
             if method in bucket["case_groups_data"]:
                 continue
@@ -379,6 +388,18 @@ def build(seen: dict[str, dict[str, dict]], legacy: dict) -> tuple[dict, dict]:
             marked["source"] = "older catalog (not seen in this firmware's UI)"
             bucket["case_groups_data"][method] = marked
             stats["legacy_only"] += 1
+
+    # Note when another module differs only by dash/underscore. Informational
+    # only: these may be two real modules (wg-client and wg_client are) or one
+    # module and a stale code path. Only the router can tell, so verify_modules.py
+    # does; the catalog just refuses to let the ambiguity be invisible.
+    by_normal: dict[str, list[str]] = {}
+    for module in new:
+        by_normal.setdefault(normalise(module), []).append(module)
+    for group in by_normal.values():
+        if len(group) > 1:
+            for module in group:
+                new[module]["spelling_variants"] = sorted(set(group) - {module})
 
     return new, stats
 
@@ -417,6 +438,15 @@ def main() -> int:
         if legacy:
             print(f"borrowing docs from {args.legacy.name}")
         catalog, stats = build(seen, legacy)
+
+        # Modules that look like each other's spelling. Some pairs are two real
+        # modules; say so without claiming which is which.
+        for module in sorted(catalog):
+            variants = catalog[module].get("spelling_variants")
+            if variants:
+                print(f"  note: {module!r} and {', '.join(map(repr, variants))} "
+                      "differ only by dash/underscore. They may be separate "
+                      "modules -- verify_modules.py checks each name independently.")
 
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(catalog, indent=1, sort_keys=True) + "\n")
