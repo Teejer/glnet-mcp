@@ -160,6 +160,18 @@ def report(con: sqlite3.Connection, days: int, now: int) -> int:
     return len(rows)
 
 
+def one_run(con: sqlite3.Connection, router: server.GlInet, prune_days: int) -> None:
+    now = int(time.time())
+    n = sample(con, router, now)
+    dropped = con.execute("DELETE FROM samples WHERE ts < ?",
+                          (now - prune_days * 86400,)).rowcount
+    con.commit()
+    print(f"recorded {n} clients at "
+          f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}"
+          + (f"; pruned {dropped} samples older than {prune_days}d" if dropped else ""),
+          flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--db", type=Path,
@@ -168,21 +180,44 @@ def main() -> int:
                     help="list devices not seen online for DAYS days and exit")
     ap.add_argument("--prune-days", type=int, default=365,
                     help="drop raw samples older than this (default 365)")
+    ap.add_argument("--loop", type=int, default=0, metavar="SECONDS",
+                    help="keep running and sample every SECONDS, instead of "
+                         "once. For container use, where there is no systemd "
+                         "timer to do it.")
     args = ap.parse_args()
 
     con = connect(args.db)
-    now = int(time.time())
     if args.report:
-        report(con, args.report, now)
+        report(con, args.report, int(time.time()))
         return 0
 
     router = server.GlInet(server.Config())
-    n = sample(con, router, now)
-    horizon = now - args.prune_days * 86400
-    dropped = con.execute("DELETE FROM samples WHERE ts < ?", (horizon,)).rowcount
-    con.commit()
-    print(f"recorded {n} clients at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}"
-          + (f"; pruned {dropped} samples older than {args.prune_days}d" if dropped else ""))
+    if not args.loop:
+        one_run(con, router, args.prune_days)
+        return 0
+
+    # Loop mode exists because the deployment that needs it runs in a container
+    # on a box where the agent cannot get root, so there is no timer to lean on.
+    # It is deliberately not clever: sleep, sample, repeat. A failed sample is
+    # logged and skipped rather than fatal, because the router reboots and the
+    # sampler outliving a reboot is the entire point.
+    import random
+    import signal
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(True))
+    print(f"sampling every {args.loop}s into {args.db}", flush=True)
+    while not stop:
+        try:
+            one_run(con, router, args.prune_days)
+        except Exception as exc:
+            print(f"sample failed ({type(exc).__name__}: {exc}); keeping the "
+                  f"previous data and trying again", flush=True)
+        nap = args.loop + random.uniform(-min(60, args.loop / 10),
+                                         min(60, args.loop / 10))
+        for _ in range(int(nap)):
+            if stop:
+                break
+            time.sleep(1)
     return 0
 
 

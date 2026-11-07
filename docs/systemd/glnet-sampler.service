@@ -1,0 +1,17 @@
+[Unit]
+Description=glnet client-activity sampler (records when each device was last seen)
+Documentation=file:%h/Documents/ai/mcp/glnet/client_sampler.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/ai/mcp/glnet
+Environment=GLNET_SAMPLER_DB=%h/.local/share/glnet-sampler/clients.sqlite3
+ExecStart=%h/Documents/ai/mcp/glnet/.venv/bin/python %h/Documents/ai/mcp/glnet/client_sampler.py
+# Read-only against the router: one clients.get_list call. Nothing here writes
+# to the router, so a stray run has no side effect beyond a database row.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=90

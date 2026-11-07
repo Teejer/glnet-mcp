@@ -1,0 +1,14 @@
+[Unit]
+Description=Sample glnet client presence every 15 minutes
+# Persistent=true matters more than it looks: if archpro was down or asleep
+# through a slot, the timer catches up with a single run at next boot instead
+# of silently skipping it. A skipped sample is a hole in exactly the data this
+# timer exists to collect.
+[Timer]
+OnCalendar=*:0/15
+RandomizedDelaySec=90
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

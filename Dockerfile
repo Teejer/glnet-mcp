@@ -18,7 +18,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py ./
+COPY server.py client_sampler.py ./
 
 USER 10000:10000
 

@@ -371,7 +371,9 @@ requiring SSH:
 | `extract_handler_docs.py` | recover parameters and doc comments from the firmware's own handler files |
 | `luaread.py` | reader for the vendor's non-standard Lua 5.1 bytecode; what the line above is built on |
 | `client_sampler.py` | record when each device was actually last seen, and `--report 30` for stale ones |
+| `sampler-container.sh` | run the sampler as a self-scheduling container, for a box where you have docker but not root |
 | `test_client_sampler.py` | offline tests for the sampler; no router needed |
+| `docs/systemd/` | the service and timer used where a timer is available |
 | `backup_config.sh` | same backup as `backup_config`, from a shell; `--verify` checks an existing archive |
 | `snapshot_state.py` | record 17 readable config methods to `snapshots/`, and `--diff` against the previous one |
 | `verify_modules.py` | ask the router, once per module, whether that module exists — and per method with `--module X --methods` |
@@ -391,9 +393,13 @@ So last-seen has to be observed, which is what the sampler does: one
 `clients.get_list` call on a timer into a SQLite file in
 `~/.local/share/glnet-sampler/`. A `systemd --user` timer at 15 minutes suits
 it, with `Persistent=true` so a missed slot catches up instead of leaving a
-hole. Resolution is the poll interval: a device that connects and leaves between
-two samples is invisible, and that is the honest limit of the design, not an
-implementation detail to fix later.
+hole. If you have no root and no lingering, `sampler-container.sh` runs it as a
+container that sleeps between samples and leans on docker's restart policy
+instead; the units in `docs/systemd/` are the timer version of the same thing.
+
+Resolution is the poll interval either way: a device that connects and leaves
+between two samples is invisible, and that is the honest limit of the design,
+not an implementation detail to fix later.
 
 `snapshot_state.py` is the one that pays for itself. Run it before probing an
 undocumented method, run it again afterwards, and you know within seconds whether
