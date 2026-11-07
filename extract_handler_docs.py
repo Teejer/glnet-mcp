@@ -199,16 +199,20 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("rootfs", type=Path, help="extracted firmware rootfs")
     ap.add_argument("--apply", action="store_true",
-                    help="stamp findings into api_description.json")
+                    help="stamp findings into the catalog")
+    ap.add_argument("--catalog", type=Path, default=CATALOG,
+                    help=f"catalog to stamp (default {CATALOG.name}); use the "
+                         "merged file so stamping cannot clobber provenance")
     ap.add_argument("--module", default="", help="only this module")
     args = ap.parse_args()
+    catalog_path = args.catalog
 
     rpc = args.rootfs / "usr/lib/oui-httpd/rpc"
     if not rpc.is_dir():
         print(f"no handler directory at {rpc}", file=sys.stderr)
         return 1
 
-    catalog = json.loads(CATALOG.read_text()) if CATALOG.exists() else {}
+    catalog = json.loads(catalog_path.read_text()) if catalog_path.exists() else {}
     stamped = 0
     per_module = {}
 
@@ -261,7 +265,7 @@ def main() -> int:
 
     if args.apply:
         CATALOG.write_text(json.dumps(catalog, indent=1, sort_keys=True) + "\n")
-        print(f"stamped {stamped} methods into {CATALOG.name}")
+        print(f"stamped {stamped} methods into {catalog_path.name}")
     return 0
 
 

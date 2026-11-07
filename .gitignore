@@ -4,6 +4,7 @@
 # unclear redistribution terms.
 api_description.json
 api_description*.json.bak
+api_description.pre-*.json
 
 # Generated / scratch
 __pycache__/

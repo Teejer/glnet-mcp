@@ -388,6 +388,16 @@ def _uncertain(source: str) -> bool:
 
 def hint_for(module: str, method: str) -> str:
     """The catalog's own request example for a method, for error messages."""
+    mod = catalog().get(module) or {}
+    if mod.get("firmware_handler") == "absent":
+        # Checked before anything else: when the image contains no handler file
+        # for the module, no method under that name can work, and an example
+        # request would be actively misleading.
+        twin = mod.get("spelling_variants") or []
+        return (f"{module} is in the catalog but this firmware ships no "
+                f"usr/lib/oui-httpd/rpc/{module}, so every method under it "
+                f"answers Method not found"
+                + (f"; the live module is {twin[0]!r}" if twin else ""))
     entry = find_method(module, method)
     if not entry:
         if not catalog():
@@ -668,6 +678,11 @@ def api_search(query: str, limit: int = 15) -> dict:
     object, an empty one, or a payload, and where the UI builds that payload. That
     is observed from the firmware's own JavaScript, not guessed.
 
+    Each hit carries `firmware_handler`: whether the image actually contains a
+    usr/lib/oui-httpd/rpc/<module> for that module. "absent" means it does not,
+    so the method cannot be called under that name however correct it looks --
+    usually a dead underscore alias whose dashed twin is live.
+
     Matching is token-wise and underscore-insensitive, so "static bind" finds
     add_static_bind and "port forward" finds add_port_forward.
     """
@@ -682,6 +697,13 @@ def api_search(query: str, limit: int = 15) -> dict:
         # disjoint methods -- but worth surfacing, because typing the wrong
         # separator gets a Method not found that looks like a missing feature.
         variants = data.get("spelling_variants") or []
+        # build_catalog cross-checks every module name against the handler files
+        # the firmware actually ships. "absent" means there is no
+        # usr/lib/oui-httpd/rpc/<module> in the image at all, so nothing under
+        # this name can be called -- wg_server and friends are dead underscore
+        # aliases whose dashed twin is the live module.
+        handler = data.get("firmware_handler") or "unknown"
+        module_note = data.get("note") or ""
         for name, entry in data.get("case_groups_data", {}).items():
             desp = ((entry.get("data") or {}).get("desp", "") or "").lower()
             # Underscores and hyphens in identifiers are word boundaries to a
@@ -705,6 +727,8 @@ def api_search(query: str, limit: int = 15) -> dict:
             # say which is which, so a stale hit cannot read like a live one.
             if _uncertain(source):
                 score -= 6
+            if handler == "absent":
+                score -= 12
             hit = {
                 "module": mod,
                 "method": name,
@@ -741,6 +765,20 @@ def api_search(query: str, limit: int = 15) -> dict:
                     f"the wire name is exactly {mod!r}; "
                     f"{', '.join(repr(v) for v in variants)} "
                     "is a different module, not a spelling of this one")
+            if handler == "absent":
+                # Rank it last and say why, rather than silently dropping it: a
+                # caller searching for wg_server wants to be told the dashed
+                # name is the live one, not that the method does not exist.
+                hit["firmware_handler"] = "absent"
+                hit["no_handler_in_firmware"] = (
+                    f"this firmware ships no usr/lib/oui-httpd/rpc/{mod}, so "
+                    "calling it returns Method not found"
+                    + (f"; try {', '.join(repr(v) for v in variants)}"
+                       if variants else ""))
+            elif handler != "unknown":
+                hit["firmware_handler"] = handler
+            if module_note:
+                hit["module_note"] = module_note
             scored.append((score, hit))
 
     scored.sort(key=lambda pair: (-pair[0], pair[1]["module"], pair[1]["method"]))

@@ -93,6 +93,17 @@ in this repo is written here; the catalog is a build artifact, like a lockfile.
 
 On a BE9300 running 4.10.1 this produces 347 methods across 51 modules.
 
+Rebuilding is not idempotent, and the first time I ran it over a working catalog
+it cost 106 methods without complaining. `build_catalog.py` knows only what the
+firmware's UI bundle and the `--legacy` catalog contain; it knows nothing about
+methods recovered afterwards from the handler files, and those are where most of
+the parameter knowledge lives. `merge_catalog.py` exists to make the rebuild
+additive: it takes the rebuilt file as the base, because that is the only one
+carrying the per-module `firmware_handler` cross-check, carries forward anything
+the live catalog has that the rebuild dropped, and labels where each carried
+entry actually came from. On 4.10.1 that is 89 handler-recovered methods carried
+and none silently lost.
+
 ## Where parameters come from
 
 The catalog knows which methods exist; parameters are a separate problem, and
@@ -350,15 +361,39 @@ Things that only show up by running this against real hardware:
 
 ## Scripts
 
-Three shell/python helpers alongside the server, all using the same credentials
-and none of them requiring SSH:
+Helpers alongside the server, all using the same credentials and none of them
+requiring SSH:
 
 | | |
 |---|---|
 | `build_catalog.py` | generate `api_description.json` from a firmware image |
+| `merge_catalog.py` | rebuild without losing what the rebuild cannot know (see above) |
+| `extract_handler_docs.py` | recover parameters and doc comments from the firmware's own handler files |
+| `luaread.py` | reader for the vendor's non-standard Lua 5.1 bytecode; what the line above is built on |
+| `client_sampler.py` | record when each device was actually last seen, and `--report 30` for stale ones |
+| `test_client_sampler.py` | offline tests for the sampler; no router needed |
 | `backup_config.sh` | same backup as `backup_config`, from a shell; `--verify` checks an existing archive |
 | `snapshot_state.py` | record 17 readable config methods to `snapshots/`, and `--diff` against the previous one |
 | `verify_modules.py` | ask the router, once per module, whether that module exists — and per method with `--module X --methods` |
+
+`client_sampler.py` exists because the router cannot answer "when was this
+device last here". Rebuild the catalog and you will find a field named
+`online_time` that appears to answer it. It does not: it is `client.db`'s
+`seen` column, which is when the row was created. Verified on a live router by
+diffing two backups three hours apart with fifteen devices connected -- `tx`
+moved on 14 rows, `seen` on none -- and then by comparing all 66 rows against
+the API, where `online_time` equalled `seen` exactly, on every one. There is
+no association history either: the log ring holds about five hours, the hostapd
+log holds four lines since boot, and this vendor driver exports no station
+records to nl80211, so there is no `inactive time` to read.
+
+So last-seen has to be observed, which is what the sampler does: one
+`clients.get_list` call on a timer into a SQLite file in
+`~/.local/share/glnet-sampler/`. A `systemd --user` timer at 15 minutes suits
+it, with `Persistent=true` so a missed slot catches up instead of leaving a
+hole. Resolution is the poll interval: a device that connects and leaves between
+two samples is invisible, and that is the honest limit of the design, not an
+implementation detail to fix later.
 
 `snapshot_state.py` is the one that pays for itself. Run it before probing an
 undocumented method, run it again afterwards, and you know within seconds whether
